@@ -1,0 +1,8 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/home/ubuntu/.gemini/statusline-blue.js",
+    "enabled": true,
+    "padding": 0
+  }
+}
