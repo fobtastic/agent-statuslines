@@ -142,59 +142,43 @@ try {
     // Silent fail if git command errors or timeout
   }
 
-  // Read ccstatusline usage cache if it exists
+  // Read actual agy prompt history from history.jsonl
   let usageStr = "";
   try {
-    const usageFile = path.join(home, '.cache', 'ccstatusline', 'usage.json');
-    if (fs.existsSync(usageFile)) {
-      const usageData = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
-      if (usageData) {
-        const sessionCount = usageData.sessionUsage !== undefined ? usageData.sessionUsage : 0;
-        const weeklyCount = usageData.weeklyUsage !== undefined ? usageData.weeklyUsage : 0;
-
-        const quotaColor = (count) => {
-          if (count > 40) return "\x1b[1;31m";
-          if (count > 25) return "\x1b[1;33m";
-          return "\x1b[1;32m";
-        };
-
-        const now = Date.now();
-        let sessionResetStr = "";
-        if (usageData.sessionResetAt) {
-          const resetTime = new Date(usageData.sessionResetAt).getTime();
-          const diffMs = resetTime - now;
-          if (diffMs > 0) {
-            const diffMins = Math.round(diffMs / 60000);
-            if (diffMins < 60) {
-              sessionResetStr = ` (in ${diffMins}m)`;
-            } else {
-              const diffHrs = Math.floor(diffMins / 60);
-              const remainingMins = diffMins % 60;
-              sessionResetStr = ` (in ${diffHrs}h ${remainingMins}m)`;
-            }
+    const historyFile = path.join(home, '.gemini', 'antigravity-cli', 'history.jsonl');
+    if (fs.existsSync(historyFile)) {
+      const content = fs.readFileSync(historyFile, 'utf8');
+      const lines = content.trim().split('\n');
+      
+      const now = Date.now();
+      const fiveHoursAgo = now - 5 * 60 * 60 * 1000;
+      const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
+      
+      let count5h = 0;
+      let count7d = 0;
+      
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry && entry.timestamp) {
+            const ts = entry.timestamp;
+            if (ts >= fiveHoursAgo) count5h++;
+            if (ts >= sevenDaysAgo) count7d++;
           }
-        }
-
-        let weeklyResetStr = "";
-        if (usageData.weeklyResetAt) {
-          const resetTime = new Date(usageData.weeklyResetAt).getTime();
-          const diffMs = resetTime - now;
-          if (diffMs > 0) {
-            const diffDays = Math.floor(diffMs / (24 * 3600000));
-            const diffHrs = Math.floor((diffMs % (24 * 3600000)) / 3600000);
-            if (diffDays > 0) {
-              weeklyResetStr = ` (in ${diffDays}d ${diffHrs}h)`;
-            } else {
-              weeklyResetStr = ` (in ${diffHrs}h)`;
-            }
-          }
-        }
-
-        const sessionColored = `${quotaColor(sessionCount)}${sessionCount}${RESET}`;
-        const weeklyColored = `${quotaColor(weeklyCount)}${weeklyCount}${RESET}`;
-
-        usageStr = ` ${GRAY}|${RESET} 📊 5h: ${sessionColored}${sessionResetStr} | 7d: ${weeklyColored}${weeklyResetStr}`;
+        } catch (e) {}
       }
+
+      const quotaColor = (count) => {
+        if (count > 40) return "\x1b[1;31m";
+        if (count > 25) return "\x1b[1;33m";
+        return "\x1b[1;32m";
+      };
+
+      const sessionColored = `${quotaColor(count5h)}${count5h}${RESET}`;
+      const weeklyColored = `${quotaColor(count7d)}${count7d}${RESET}`;
+
+      usageStr = ` ${GRAY}|${RESET} 📊 5h: ${sessionColored} | 7d: ${weeklyColored}`;
     }
   } catch (e) {
     // Silent fail
