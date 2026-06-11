@@ -264,7 +264,7 @@ try {
   }
 
   // Print to stdout (two lines)
-  console.log(`${BLUE}🤖 ${model}${RESET}${statusStr} ${GRAY}|${RESET} 📂 ${cwdShort}${gitStr}\n${GRAY}└─▶${RESET} Context: [${BLUE}${bar}${GRAY}${barEmpty}${RESET}] ${usedPercent}% (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)${cacheStr}`);
+  console.log(`${BLUE}🤖 ${model}${RESET}${statusStr} ${GRAY}|${RESET} 📂 ${cwdShort}${gitStr}\x1b[K\n${GRAY}└─▶${RESET} Context: [${BLUE}${bar}${GRAY}${barEmpty}${RESET}] ${usedPercent}% (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)${cacheStr}\x1b[K`);
 } catch (e) {
   process.exit(0);
 }
