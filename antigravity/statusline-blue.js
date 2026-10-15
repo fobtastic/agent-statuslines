@@ -147,19 +147,28 @@ try {
   if (hitRate > 100) hitRate = 100.0; // Cap to 100% to handle race conditions in token count propagation
   const cacheHitRate = hitRate.toFixed(1);
 
+  const runningSubagents = Array.isArray(data.subagents)
+    ? data.subagents.filter((s) => !s.status || s.status === "running").length
+    : 0;
+
   let cacheTtlStr = "";
   const isAgentBusy =
     data.agent_state === "thinking" ||
     data.agent_state === "tool_use" ||
     data.agent_state === "working" ||
-    data.agent_state === "responding";
+    data.agent_state === "responding" ||
+    runningSubagents > 0;
 
   if (usedTokens > 0 && data.transcript_path) {
     if (isAgentBusy) {
       cacheTtlStr = ` ${GRAY}(${GREEN}hot${GRAY})${RESET}`;
     } else {
       try {
-        const stat = fs.statSync(data.transcript_path);
+        let tp = data.transcript_path;
+        if (!fs.existsSync(tp) && tp.includes("/.gemini/antigravity/")) {
+          tp = tp.replace("/.gemini/antigravity/", "/.gemini/antigravity-cli/");
+        }
+        const stat = fs.statSync(tp);
         const ageSec = Math.max(0, Math.floor((Date.now() - stat.mtimeMs) / 1000));
         const ttlTotal = 300;
         if (ageSec < ttlTotal) {
@@ -217,6 +226,9 @@ try {
     statusStr = ` \x1b[90m[\x1b[0m\x1b[1;32m🟢 Ready\x1b[0m\x1b[90m]\x1b[0m`;
   }
 
+  if (runningSubagents > 0) {
+    statusStr += ` ${GRAY}[${RESET}${CYAN}🤖 ${runningSubagents} sub${RESET}${GRAY}]${RESET}`;
+  }
   if (typeof data.task_count === "number" && data.task_count > 0) {
     statusStr += ` ${GRAY}[${RESET}${CYAN}⏳ ${data.task_count} task${data.task_count > 1 ? "s" : ""}${RESET}${GRAY}]${RESET}`;
   }
