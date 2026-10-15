@@ -1,7 +1,36 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
-const { execSync, spawn } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
+
+const home = process.env.HOME || '/home/ubuntu';
+
+const formatDuration = (seconds) => {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return 'now';
+  const s = Math.floor(seconds);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) return h > 0 ? `${d}d${h}h` : `${d}d`;
+  if (h > 0) return m > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${h}h`;
+  if (m > 0) return sec > 0 && m < 10 ? `${m}m${String(sec).padStart(2, '0')}s` : `${m}m`;
+  return `${sec}s`;
+};
+
+const resolveCmuxCli = () => {
+  const candidates = [
+    process.env.CMUX_BUNDLED_CLI_PATH,
+    "/Applications/cmux.app/Contents/Resources/bin/cmux",
+    "/opt/homebrew/bin/cmux",
+    "/usr/local/bin/cmux",
+    path.join(home, ".local/bin/cmux"),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  return "";
+};
 
 try {
   const input = fs.readFileSync(0, 'utf-8');
@@ -9,12 +38,17 @@ try {
 
   const data = JSON.parse(input);
 
-  // Dump telemetry to verify structure if needed
-  try {
-    fs.writeFileSync('/tmp/telemetry_dump.json', JSON.stringify(data, null, 2));
-  } catch (e) {}
+  if (process.env.AGY_STATUSLINE_DEBUG === '1') {
+    try {
+      fs.writeFileSync('/tmp/telemetry_dump.json', JSON.stringify(data, null, 2));
+    } catch (e) {}
+  }
 
-  const model = data.model?.display_name || "Antigravity";
+  let model = data.model?.display_name || "Antigravity";
+  const effort = data.model?.effort;
+  if (effort && !model.toLowerCase().includes(effort.toLowerCase())) {
+    model = `${model} (${effort.charAt(0).toUpperCase() + effort.slice(1)})`;
+  }
   const agentKey = "agy";
 
   // Update CMUX sidebar status dynamically
@@ -45,16 +79,7 @@ try {
       color = "#8E8E93";
     }
 
-    let cmuxCli = process.env.CMUX_BUNDLED_CLI_PATH || "";
-    if (!cmuxCli || !fs.existsSync(cmuxCli)) {
-      if (fs.existsSync("/Applications/cmux.app/Contents/Resources/bin/cmux")) {
-        cmuxCli = "/Applications/cmux.app/Contents/Resources/bin/cmux";
-      } else {
-        try {
-          cmuxCli = execSync("which cmux 2>/dev/null", { encoding: "utf8" }).trim();
-        } catch (e) {}
-      }
-    }
+    const cmuxCli = resolveCmuxCli();
     if (cmuxCli) {
       let socketPath = process.env.CMUX_SOCKET_PATH || "";
       if (!socketPath && home) {
@@ -74,21 +99,17 @@ try {
         args.push("--window", windowId);
       }
       args.push("--icon", icon, "--color", color);
-      const logFd = fs.openSync('/tmp/cmux_spawn.log', 'w');
       const child = spawn(cmuxCli, args, {
         detached: true,
-        stdio: ['ignore', logFd, logFd]
+        stdio: 'ignore'
       });
       child.unref();
     }
-  } catch (e) {
-    fs.writeFileSync('/tmp/statusline_err.log', e.stack || e.message);
-  }
+  } catch (e) {}
 
   const cwd = data.cwd || process.cwd();
 
   // Shorten CWD to home-relative path
-  const home = process.env.HOME || '/home/ubuntu';
   const cwdShort = cwd.startsWith(home) ? cwd.replace(home, '~') : cwd;
 
   // Retrieve context window data
@@ -113,17 +134,71 @@ try {
 
   // Color Definitions (ANSI)
   const BLUE = "\x1b[1;34m";
+  const GREEN = "\x1b[1;32m";
+  const YELLOW = "\x1b[1;33m";
+  const RED = "\x1b[1;31m";
+  const CYAN = "\x1b[1;36m";
   const RESET = "\x1b[0m";
   const GRAY = "\x1b[90m";
 
-  // Calculate Context Cache efficiency (Gemini specific!)
+  // Calculate Context Cache efficiency & freshness/TTL (5m implicit cache window)
   const cacheRead = ctx.current_usage?.cache_read_input_tokens || 0;
   let hitRate = usedTokens > 0 ? ((cacheRead / usedTokens) * 100) : 0;
   if (hitRate > 100) hitRate = 100.0; // Cap to 100% to handle race conditions in token count propagation
   const cacheHitRate = hitRate.toFixed(1);
 
+  let cacheTtlStr = "";
+  const isAgentBusy =
+    data.agent_state === "thinking" ||
+    data.agent_state === "tool_use" ||
+    data.agent_state === "working" ||
+    data.agent_state === "responding";
+
+  if (usedTokens > 0 && data.transcript_path) {
+    if (isAgentBusy) {
+      cacheTtlStr = ` ${GRAY}(${GREEN}hot${GRAY})${RESET}`;
+    } else {
+      try {
+        const stat = fs.statSync(data.transcript_path);
+        const ageSec = Math.max(0, Math.floor((Date.now() - stat.mtimeMs) / 1000));
+        const ttlTotal = 300;
+        if (ageSec < ttlTotal) {
+          const remSec = ttlTotal - ageSec;
+          const ttlColor = remSec > 60 ? GREEN : YELLOW;
+          cacheTtlStr = ` ${GRAY}(TTL ${ttlColor}${formatDuration(remSec)}${GRAY})${RESET}`;
+        } else {
+          cacheTtlStr = ` ${GRAY}(cold ${formatDuration(ageSec)})${RESET}`;
+        }
+      } catch (e) {}
+    }
+  }
+
   // Build Antigravity telemetry segments
-  const cacheStr = ` ${GRAY}|${RESET} ⚡ Cache Hit: ${BLUE}${cacheHitRate}%${RESET}`;
+  const cacheStr = ` ${GRAY}|${RESET} ⚡ Cache: ${BLUE}${cacheHitRate}%${RESET}${cacheTtlStr}`;
+
+  let quotaStr = "";
+  if (data.quota && typeof data.quota === "object") {
+    const isGeminiModel = /gemini|gemma|antigravity/i.test(model);
+    const prefix = isGeminiModel ? "gemini" : "3p";
+    const q5h = data.quota[`${prefix}-5h`] || data.quota["gemini-5h"];
+    const qWk = data.quota[`${prefix}-weekly`] || data.quota["gemini-weekly"];
+
+    const formatBucket = (label, bucket) => {
+      if (!bucket || typeof bucket.remaining_fraction !== "number") return "";
+      const pct = Math.max(0, Math.min(100, Math.round(bucket.remaining_fraction * 100)));
+      const color = pct >= 50 ? GREEN : pct >= 20 ? YELLOW : RED;
+      const reset =
+        typeof bucket.reset_in_seconds === "number" && bucket.reset_in_seconds > 0
+          ? ` ${GRAY}↻${formatDuration(bucket.reset_in_seconds)}${RESET}`
+          : "";
+      return `${label}: ${color}${pct}%${RESET}${reset}`;
+    };
+
+    const parts = [formatBucket("5h", q5h), formatBucket("Wk", qWk)].filter(Boolean);
+    if (parts.length > 0) {
+      quotaStr = ` ${GRAY}|${RESET} 🔋 ${parts.join(` ${GRAY}·${RESET} `)}`;
+    }
+  }
 
   const outTokens = ctx.total_output_tokens || 0;
   const outStr = outTokens > 0 ? `, Out: ${formatTokens(outTokens)}` : "";
@@ -142,18 +217,32 @@ try {
     statusStr = ` \x1b[90m[\x1b[0m\x1b[1;32m🟢 Ready\x1b[0m\x1b[90m]\x1b[0m`;
   }
 
+  if (typeof data.task_count === "number" && data.task_count > 0) {
+    statusStr += ` ${GRAY}[${RESET}${CYAN}⏳ ${data.task_count} task${data.task_count > 1 ? "s" : ""}${RESET}${GRAY}]${RESET}`;
+  }
+
   // Git branch, dirty status, and PR info
   let gitStr = "";
   try {
-    // Run all git queries in a single child process to prevent cursor lag
-    const cmd = 'git rev-parse --show-toplevel --abbrev-ref HEAD 2>/dev/null && ( [ -n "$(git status --porcelain 2>/dev/null)" ] && echo "dirty" || echo "clean" )';
-    const output = execSync(cmd, { cwd, timeout: 350, encoding: 'utf8' }).trim();
-    if (output) {
-      const lines = output.split('\n');
+    const revOut = execFileSync(
+      'git',
+      ['--no-optional-locks', 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD'],
+      { cwd, timeout: 200, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+    if (revOut) {
+      const lines = revOut.split('\n');
       if (lines.length >= 2) {
         const repoDir = lines[0].trim();
         const gitBranch = lines[1].trim();
-        const isDirty = lines[2] ? lines[2].trim() === "dirty" : false;
+        let isDirty = false;
+        try {
+          const dirtyOut = execFileSync(
+            'git',
+            ['--no-optional-locks', 'status', '--porcelain', '-uno'],
+            { cwd: repoDir, timeout: 200, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+          ).trim();
+          isDirty = dirtyOut.length > 0;
+        } catch (e) {}
 
         if (repoDir && gitBranch) {
           const dirtyIndicator = isDirty ? "\x1b[1;31m●\x1b[0m" : "";
@@ -172,10 +261,16 @@ try {
 
           const cachedEntry = cache[cacheKey];
           const now = Date.now();
+          const isStale = !cachedEntry || (now - cachedEntry.updatedAt > 180000);
+          const isFetching = cachedEntry?.fetchingAt && (now - cachedEntry.fetchingAt < 30000);
 
           // Trigger background cache update if missing or older than 3 minutes (180000ms)
-          if (!cachedEntry || (now - cachedEntry.updatedAt > 180000)) {
+          if (isStale && !isFetching) {
             try {
+              cache[cacheKey] = Object.assign({}, cachedEntry || { state: 'NONE', updatedAt: 0 }, {
+                fetchingAt: now
+              });
+              fs.writeFileSync(cacheFile, JSON.stringify(cache, null, 2), 'utf8');
               const child = spawn(process.execPath, [
                 path.join(__dirname, 'update_pr_cache.js'),
                 repoDir,
@@ -188,7 +283,7 @@ try {
             } catch (e) {}
           }
 
-          if (cachedEntry && cachedEntry.state !== "NONE") {
+          if (cachedEntry && cachedEntry.state !== "NONE" && cachedEntry.number) {
             pr = cachedEntry;
           }
 
@@ -264,7 +359,8 @@ try {
   }
 
   // Print to stdout (two lines)
-  console.log(`${BLUE}🤖 ${model}${RESET}${statusStr} ${GRAY}|${RESET} 📂 ${cwdShort}${gitStr}\x1b[K\n${GRAY}└─▶${RESET} Context: [${BLUE}${bar}${GRAY}${barEmpty}${RESET}] ${usedPercent}% (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)${cacheStr}\x1b[K`);
+  console.log(`${BLUE}🤖 ${model}${RESET}${statusStr} ${GRAY}|${RESET} 📂 ${cwdShort}${gitStr}\x1b[K\n${GRAY}└─▶${RESET} Context: [${BLUE}${bar}${GRAY}${barEmpty}${RESET}] ${usedPercent}% (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)${cacheStr}${quotaStr}\x1b[K`);
+  process.exit(0);
 } catch (e) {
   process.exit(0);
 }
