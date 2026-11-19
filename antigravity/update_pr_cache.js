@@ -70,15 +70,22 @@ try {
   });
 
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  try {
-    for (const name of fs.readdirSync(prCacheDir)) {
-      if (!name.endsWith('.json')) continue;
-      const fullPath = path.join(prCacheDir, name);
-      try {
-        if (fs.statSync(fullPath).mtimeMs < cutoff) {
-          fs.unlinkSync(fullPath);
-        }
-      } catch (_) {}
-    }
-  } catch (_) {}
+  const pruneDir = (dir, matchFn) => {
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!matchFn(name)) continue;
+        const fullPath = path.join(dir, name);
+        try {
+          if (fs.statSync(fullPath).mtimeMs < cutoff) {
+            fs.unlinkSync(fullPath);
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  };
+
+  pruneDir(prCacheDir, (name) => name.endsWith('.json') || name.endsWith('.tmp'));
+  if (path.basename(prCacheDir) === 'pr') {
+    pruneDir(path.dirname(prCacheDir), (name) => /^(git|cmux)-.+\.(json|tmp)$/.test(name));
+  }
 } catch (_) {}

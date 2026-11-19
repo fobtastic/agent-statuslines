@@ -219,6 +219,7 @@ const readGitInfoSync = (startDir) => {
       const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
       let branch = '';
       let detached = false;
+      let isReftable = false;
       if (head.startsWith('ref: refs/heads/')) {
         branch = head.slice('ref: refs/heads/'.length).trim();
       } else if (head.startsWith('ref: ')) {
@@ -227,8 +228,11 @@ const readGitInfoSync = (startDir) => {
         branch = head.slice(0, 7);
         detached = true;
       }
-      if (branch === '.invalid') branch = '';
-      return { repoDir: dir, branch, detached };
+      if (branch === '.invalid') {
+        branch = '';
+        isReftable = true;
+      }
+      return { repoDir: dir, branch, detached, isReftable };
     }
   } catch (_) {}
   return null;
@@ -236,17 +240,42 @@ const readGitInfoSync = (startDir) => {
 
 const refreshGitDirty = (repoDir, cachePath) => {
   if (!repoDir || !cachePath) return;
+  const runGit = (args) =>
+    execFileSync('git', ['--no-optional-locks', ...args], {
+      cwd: repoDir,
+      timeout: 3000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
   try {
-    const out = execFileSync(
-      'git',
-      ['--no-optional-locks', 'status', '--porcelain', '-uno'],
-      { cwd: repoDir, timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }
-    ).trim();
-    writeJsonAtomic(cachePath, { repoDir, dirty: out.length > 0, updatedAt: Date.now() });
+    const out = runGit(['status', '--porcelain', '-uno']);
+    const payload = { repoDir, dirty: out.length > 0, updatedAt: Date.now() };
+    if (readGitInfoSync(repoDir)?.isReftable) {
+      let resolvedBranch = '';
+      let resolvedDetached = false;
+      try {
+        resolvedBranch = runGit(['symbolic-ref', '--short', '-q', 'HEAD']);
+      } catch (_) {}
+      if (!resolvedBranch) {
+        try {
+          const sha = runGit(['rev-parse', '--short', 'HEAD']);
+          if (sha && sha !== 'HEAD') {
+            resolvedBranch = sha;
+            resolvedDetached = true;
+          }
+        } catch (_) {}
+      }
+      if (resolvedBranch && resolvedBranch !== '.invalid') {
+        payload.branch = resolvedBranch;
+        payload.detached = resolvedDetached;
+      }
+    }
+    writeJsonAtomic(cachePath, payload);
   } catch (_) {}
 };
 
-const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride = '') => {
+const getGitCacheEntry = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride = '') => {
   const cachePath = path.join(getCacheDir(cacheDirOverride), `git-${hashKey(repoDir)}.json`);
   const entry = readJsonSafe(cachePath);
   const isStale = !entry || typeof entry.updatedAt !== 'number' || nowMs - entry.updatedAt >= GIT_DIRTY_TTL_MS;
@@ -254,12 +283,17 @@ const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride
 
   if (spawnRefresh && isStale && !isRefreshing) {
     try {
-      writeJsonAtomic(cachePath, {
+      const lockPayload = {
         repoDir,
         dirty: Boolean(entry?.dirty),
         updatedAt: entry?.updatedAt || 0,
         refreshingAt: nowMs,
-      });
+      };
+      if (typeof entry?.branch === 'string' && entry.branch) {
+        lockPayload.branch = entry.branch;
+        lockPayload.detached = Boolean(entry.detached);
+      }
+      writeJsonAtomic(cachePath, lockPayload);
       const child = spawn(process.execPath, [__filename, '--refresh-git', repoDir, cachePath], {
         detached: true,
         stdio: 'ignore',
@@ -270,8 +304,15 @@ const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride
     } catch (_) {}
   }
 
-  return Boolean(entry?.dirty);
+  return {
+    dirty: Boolean(entry?.dirty),
+    branch: typeof entry?.branch === 'string' && entry.branch !== '.invalid' ? entry.branch : '',
+    detached: Boolean(entry?.detached),
+  };
 };
+
+const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride = '') =>
+  getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDirOverride).dirty;
 
 const formatPrBadge = (pr) => {
   if (!pr || pr.state === 'NONE' || !pr.number) return '';
@@ -363,7 +404,7 @@ const resolveModelFamily = (modelObj) => {
     if (/\b(pro|argon|carbon|hydrogen|neon|orchestrator)\b/.test(ident)) {
       return { family: 'gemini', prefixes: ['gemini-pro', 'pro', 'gemini'], excludeSubPrefixes: ['gemini-flash'] };
     }
-    return { family: 'gemini', prefixes: ['gemini'], excludeSubPrefixes: [] };
+    return { family: 'gemini', prefixes: ['gemini'], excludeSubPrefixes: ['gemini-flash', 'gemini-pro'] };
   }
   return { family: '3p', prefixes: ['3p'], excludeSubPrefixes: [] };
 };
@@ -394,6 +435,20 @@ const POOL_LABELS = {
   '3p': '3P',
 };
 
+const POOL_LABEL_ENTRIES = Object.entries(POOL_LABELS).sort((a, b) => b[0].length - a[0].length);
+
+const getPoolLabelForKey = (key, fallbackPrefix = '') => {
+  if (typeof key === 'string' && key) {
+    const normKey = key.toLowerCase().replace(/_/g, '-');
+    for (const [prefix, label] of POOL_LABEL_ENTRIES) {
+      if (normKey === prefix || normKey.startsWith(`${prefix}-`)) {
+        return label;
+      }
+    }
+  }
+  return POOL_LABELS[fallbackPrefix] || '';
+};
+
 const isFractionBucket = (bucket) =>
   Boolean(bucket) &&
   bucket.disabled !== true &&
@@ -410,11 +465,10 @@ const findQuotaBucket = (quotaObj, prefixes, exactSuffixes, fuzzyRegex, excludeS
       }
     }
     for (const k of keys) {
-      const isSiblingSub = excludeSubPrefixes.some(
-        (ex) => k.startsWith(`${ex}-`) || k.startsWith(`${ex}_`) || k === ex
-      );
+      const normKey = k.toLowerCase().replace(/_/g, '-');
+      const isSiblingSub = excludeSubPrefixes.some((ex) => normKey === ex || normKey.startsWith(`${ex}-`));
       if (isSiblingSub) continue;
-      if ((k.startsWith(`${prefix}-`) || k.startsWith(`${prefix}_`)) && fuzzyRegex.test(k.slice(prefix.length + 1))) {
+      if (normKey.startsWith(`${prefix}-`) && fuzzyRegex.test(normKey.slice(prefix.length + 1))) {
         if (isFractionBucket(quotaObj[k])) {
           return { key: k, prefix, bucket: quotaObj[k] };
         }
@@ -432,8 +486,9 @@ const resolveQuotaSelection = (modelObj, quotaObj, nowMs = Date.now()) => {
   const { prefixes, excludeSubPrefixes } = resolveModelFamily(modelObj);
   const q5h = findQuotaBucket(quotaObj, prefixes, ['-5h', '_5h', '-session', '_session'], /(?:5h|hour)/i, excludeSubPrefixes);
   const qWk = findQuotaBucket(quotaObj, prefixes, ['-weekly', '-7d', '_weekly', '_7d'], /(?:week|7d)/i, excludeSubPrefixes);
-  const matchedPrefix = q5h?.prefix || qWk?.prefix || prefixes[0] || '';
-  const poolLabel = POOL_LABELS[matchedPrefix] || '';
+  const label5h = q5h ? getPoolLabelForKey(q5h.key, q5h.prefix) : '';
+  const labelWk = qWk ? getPoolLabelForKey(qWk.key, qWk.prefix) : '';
+  const poolLabel = label5h || labelWk || POOL_LABELS[prefixes[0]] || '';
 
   let credits = null;
   for (const [key, bucket] of Object.entries(quotaObj)) {
@@ -466,8 +521,8 @@ const formatQuotaSegment = (modelObj, quotaObj, nowMs, width, { includePoolLabel
     return `${prefixStr}${label}: ${color}${pct}%${RESET}${reset}`;
   };
 
-  const label5h = q5h ? POOL_LABELS[q5h.prefix] || '' : '';
-  const labelWk = qWk ? POOL_LABELS[qWk.prefix] || '' : '';
+  const label5h = q5h ? getPoolLabelForKey(q5h.key, q5h.prefix) : '';
+  const labelWk = qWk ? getPoolLabelForKey(qWk.key, qWk.prefix) : '';
   const hasMixedPools = Boolean(q5h && qWk && label5h && labelWk && label5h !== labelWk);
 
   const parts = [
@@ -547,18 +602,26 @@ const renderStatusLine = (data, opts = {}) => {
   } else {
     const gitInfo = readGitInfoSync(cwd);
     const hasNativeBranch = typeof data.vcs?.branch === 'string' && data.vcs.branch.trim().length > 0;
-    const gitBranch = hasNativeBranch ? data.vcs.branch.trim() : gitInfo?.branch || '';
-    const repoDir = gitInfo?.repoDir || (gitBranch && data.workspace?.project_dir) || '';
+    const repoDir = gitInfo?.repoDir || (hasNativeBranch && data.workspace?.project_dir) || '';
+    let gitBranch = hasNativeBranch ? data.vcs.branch.trim() : gitInfo?.branch || '';
+    let isDetached = Boolean(!hasNativeBranch && gitInfo?.detached);
+    let cachedGit = null;
+    if (!gitBranch && gitInfo?.isReftable && repoDir) {
+      cachedGit = getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDir);
+      if (cachedGit.branch) {
+        gitBranch = cachedGit.branch;
+        isDetached = cachedGit.detached;
+      }
+    }
     if (gitBranch) {
       let isDirty = false;
       if (typeof data.vcs?.dirty === 'boolean') {
         isDirty = data.vcs.dirty;
       } else if (repoDir) {
-        isDirty = getGitDirtyCached(repoDir, nowMs, spawnRefresh, cacheDir);
+        isDirty = (cachedGit || getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDir)).dirty;
       }
       const dirtyIndicator = isDirty ? `${RED}●${RESET}` : '';
-      const skipDetachedPr = Boolean(gitInfo?.detached && !hasNativeBranch);
-      const prStr = repoDir && !skipDetachedPr ? getPrBadgeCached(repoDir, gitBranch, nowMs, { spawnRefresh, cacheDir }) : '';
+      const prStr = repoDir && !isDetached ? getPrBadgeCached(repoDir, gitBranch, nowMs, { spawnRefresh, cacheDir }) : '';
       gitStr = ` ${GRAY}|${RESET} 🌿 ${BLUE}${gitBranch}${dirtyIndicator}${prStr}${RESET}`;
     }
   }
