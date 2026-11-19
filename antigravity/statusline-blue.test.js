@@ -276,6 +276,21 @@ test('reset_time ISO fallback, disabled buckets, and credits gating below 120 co
     )
   );
   assert.doesNotMatch(healthyQuotaOut, /💳/);
+
+  const wideHealthyOut = stripAnsi(
+    renderStatusLine(
+      makeBasePayload({
+        terminal_width: 120,
+        model: { id: 'claude-opus-5-5-high', display_name: 'Claude Opus 5.5 (High)' },
+        quota: {
+          '3p-5h': { remaining_fraction: 0.8, reset_in_seconds: 3600 },
+          'g1-credits': { remaining_amount: 450 },
+        },
+      }),
+      { nowMs, spawnRefresh: false }
+    )
+  );
+  assert.match(wideHealthyOut, /💳 450/);
 });
 
 test('extended agent states, optional Line 1 badges, cost threshold, and exceeds_200k_tokens', () => {
@@ -395,6 +410,7 @@ test('readGitInfoSync handles repo, worktree, detached HEAD, and reftable stubs'
       branch: 'feat/statusline',
       detached: false,
       isReftable: false,
+      headSha: '',
     });
 
     const worktree = path.join(root, 'wt-b');
@@ -408,6 +424,7 @@ test('readGitInfoSync handles repo, worktree, detached HEAD, and reftable stubs'
       branch: 'main',
       detached: false,
       isReftable: false,
+      headSha: '',
     });
 
     const repoC = path.join(root, 'repo-c');
@@ -418,6 +435,7 @@ test('readGitInfoSync handles repo, worktree, detached HEAD, and reftable stubs'
       branch: '1234567',
       detached: true,
       isReftable: false,
+      headSha: '123456789abcdef0123456789abcdef012345678',
     });
 
     const repoD = path.join(root, 'repo-d');
@@ -428,6 +446,7 @@ test('readGitInfoSync handles repo, worktree, detached HEAD, and reftable stubs'
       branch: '',
       detached: false,
       isReftable: true,
+      headSha: '',
     });
 
     const reftableNoVcs = stripAnsi(
@@ -468,14 +487,23 @@ test('--refresh-git avoids sync git forks on render and resolves reftable branch
       git: `#!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
-fs.appendFileSync(${JSON.stringify(gitLog)}, process.argv.slice(2).join(' ') + '\\n');
+const rawLine = process.argv.slice(2).join(' ') + '\\n';
 const args = process.argv.slice(2);
 if (args[0] === '--no-optional-locks') args.shift();
 const base = path.basename(process.cwd());
 if (args[0] === 'status') {
+  if (base === 'repo-normal') {
+    setTimeout(() => {
+      fs.appendFileSync(${JSON.stringify(gitLog)}, rawLine);
+      process.exit(0);
+    }, 400);
+    return;
+  }
+  fs.appendFileSync(${JSON.stringify(gitLog)}, rawLine);
   if (base === 'repo-branch') process.stdout.write(' M a.txt\\n');
   process.exit(0);
 }
+fs.appendFileSync(${JSON.stringify(gitLog)}, rawLine);
 if (args[0] === 'symbolic-ref') {
   if (base === 'repo-branch') {
     process.stdout.write('feat/reftable\\n');
@@ -495,19 +523,25 @@ process.exit(1);
     await withPatchedEnv(
       { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`, GH_REPO: undefined },
       async () => {
-        const readCacheForRepo = (repoPath, expectDetached) => {
+        const readRawCacheForRepo = (repoPath) => {
           if (!fs.existsSync(cacheDir)) return null;
           for (const f of fs.readdirSync(cacheDir)) {
             if (!f.startsWith('git-') || !f.endsWith('.json')) continue;
             const data = JSON.parse(fs.readFileSync(path.join(cacheDir, f), 'utf8'));
-            if (
-              data.repoDir === repoPath &&
-              data.updatedAt > 0 &&
-              data.refreshingAt === undefined &&
-              Boolean(data.detached) === expectDetached
-            ) {
-              return data;
-            }
+            if (data.repoDir === repoPath) return data;
+          }
+          return null;
+        };
+
+        const readCacheForRepo = (repoPath, expectDetached) => {
+          const data = readRawCacheForRepo(repoPath);
+          if (
+            data &&
+            data.updatedAt > 0 &&
+            data.refreshingAt === undefined &&
+            Boolean(data.detached) === expectDetached
+          ) {
+            return data;
           }
           return null;
         };
@@ -526,8 +560,16 @@ process.exit(1);
         assert.doesNotMatch(reftableCold, /🌿/);
         assert.equal(fs.existsSync(gitLog), false);
 
-        // Positive control: spawnRefresh: true triggers background --refresh-git (logged by stub git)
-        renderStatusLine(makeBasePayload({ cwd: repoNormal }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
+        // Positive control on production spawnRefresh: true path: must return before 400ms stub git completes
+        const tSpawn = Date.now();
+        const tStart = Date.now();
+        renderStatusLine(makeBasePayload({ cwd: repoNormal }), { nowMs: tSpawn, spawnRefresh: true, cacheDir });
+        assert.ok(Date.now() - tStart < 200, 'renderStatusLine blocked synchronously on git');
+        assert.equal(fs.existsSync(gitLog), false);
+        const lockEntry = readRawCacheForRepo(repoNormal);
+        assert.equal(lockEntry.updatedAt, 0);
+        assert.equal(lockEntry.refreshingAt, tSpawn);
+
         await waitFor(() => readCacheForRepo(repoNormal, false));
         await waitFor(() => {
           if (!fs.existsSync(prCacheDir)) return false;
@@ -631,6 +673,18 @@ test('renderStatusLine spawns --refresh-git to populate clean and dirty cache tr
       })
     );
     assert.match(dirtyRender, /🌿 main●/);
+
+    const wtDir = path.join(root, 'wt-real');
+    execFileSync('git', ['worktree', 'add', '-b', 'feat/wt', wtDir], { cwd: repo, stdio: 'ignore' });
+    const wtGitMatch = fs.readFileSync(path.join(wtDir, '.git'), 'utf8').match(/^gitdir:\s*(.+)$/m);
+    assert.ok(wtGitMatch && path.isAbsolute(wtGitMatch[1].trim()));
+    assert.deepEqual(readGitInfoSync(wtDir), {
+      repoDir: wtDir,
+      branch: 'feat/wt',
+      detached: false,
+      isReftable: false,
+      headSha: '',
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -675,8 +729,26 @@ const payloads = {
   '1234567': {
     number: 1234567,
     state: 'OPEN',
-    title: 'Detached control',
+    title: 'Detached control 7',
     url: 'https://example.test/1234567',
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ state: 'SUCCESS', status: 'COMPLETED' }],
+  },
+  '123456789': {
+    number: 123456789,
+    state: 'OPEN',
+    title: 'Detached control 9',
+    url: 'https://example.test/123456789',
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ state: 'SUCCESS', status: 'COMPLETED' }],
+  },
+  HEAD: {
+    number: 777,
+    state: 'OPEN',
+    title: 'Detached control HEAD',
+    url: 'https://example.test/777',
     mergeable: 'MERGEABLE',
     mergeStateStatus: 'CLEAN',
     statusCheckRollup: [{ state: 'SUCCESS', status: 'COMPLETED' }],
@@ -734,13 +806,21 @@ process.stdout.write(JSON.stringify(payloads[branch]));
         );
         assert.match(prConflictOut, /PR #99 ⚡Conflict/);
 
-        // Detached-HEAD positive control (writer produces branch '1234567' entry) then detached negative
-        execFileSync(process.execPath, [updater, repo, '1234567', prCacheDir], { stdio: 'ignore' });
+        // Detached-HEAD positive controls (writer produces '1234567', '123456789', 'HEAD') then detached checks
+        for (const branchName of ['1234567', '123456789', 'HEAD']) {
+          execFileSync(process.execPath, [updater, repo, branchName, prCacheDir], { stdio: 'ignore' });
+        }
         fs.writeFileSync(headPath, 'ref: refs/heads/1234567\n');
         const branch123Out = stripAnsi(
           renderStatusLine(makeBasePayload({ cwd: repo }), { spawnRefresh: false, cacheDir })
         );
         assert.match(branch123Out, /🌿 1234567 \(PR #1234567 ✅\)/);
+
+        fs.writeFileSync(headPath, 'ref: refs/heads/123456789\n');
+        const branch1239Out = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repo }), { spawnRefresh: false, cacheDir })
+        );
+        assert.match(branch1239Out, /🌿 123456789 \(PR #123456789 ✅\)/);
 
         fs.writeFileSync(headPath, '123456789abcdef0123456789abcdef012345678\n');
         const detachedOut = stripAnsi(
@@ -749,16 +829,37 @@ process.stdout.write(JSON.stringify(payloads[branch]));
         assert.match(detachedOut, /🌿 1234567/);
         assert.doesNotMatch(detachedOut, /PR #1234567/);
 
-        const detachedWithVcsSha = stripAnsi(
-          renderStatusLine(makeBasePayload({ cwd: repo, vcs: { type: 'git', branch: '1234567' } }), {
+        for (const [nativeBranch, prNum] of [
+          ['1234567', 1234567],
+          ['123456789', 123456789],
+          ['HEAD', 777],
+        ]) {
+          const out = stripAnsi(
+            renderStatusLine(makeBasePayload({ cwd: repo, vcs: { type: 'git', branch: nativeBranch } }), {
+              spawnRefresh: false,
+              cacheDir,
+            })
+          );
+          assert.match(out, new RegExp(`🌿 ${nativeBranch}`));
+          assert.doesNotMatch(out, new RegExp(`PR #${prNum}`));
+        }
+
+        // Genuine non-SHA branch name supplied by native vcs overrides detached HEAD PR skip
+        const nonEchoOverride = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repo, vcs: { type: 'git', branch: 'feat/pr-ok' } }), {
             spawnRefresh: false,
             cacheDir,
           })
         );
-        assert.match(detachedWithVcsSha, /🌿 1234567/);
-        assert.doesNotMatch(detachedWithVcsSha, /PR #1234567/);
+        assert.match(nonEchoOverride, /🌿 feat\/pr-ok \(PR #42 ✅\)/);
 
-        // 7-day pruning covers stale .tmp and git-/cmux- cache files without removing fresh PR entries
+        // 7-day pruning deletes stale .tmp and git-/cmux- files while keeping fresh root & PR entries
+        const gitCacheFiles = fs.readdirSync(cacheDir).filter((f) => f.startsWith('git-') && f.endsWith('.json'));
+        assert.equal(gitCacheFiles.length, 1);
+        const freshGitFile = path.join(cacheDir, gitCacheFiles[0]);
+        const freshCmuxFile = path.join(cacheDir, 'cmux-fresh.json');
+        fs.writeFileSync(freshCmuxFile, '{}');
+
         const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
         const stalePrTmp = path.join(prCacheDir, 'stale.123.tmp');
         const staleGitJson = path.join(cacheDir, 'git-stale.json');
@@ -772,7 +873,9 @@ process.stdout.write(JSON.stringify(payloads[branch]));
         assert.equal(fs.existsSync(stalePrTmp), false);
         assert.equal(fs.existsSync(staleGitJson), false);
         assert.equal(fs.existsSync(staleCmuxTmp), false);
-        assert.equal(readPrEntries().length, 3);
+        assert.equal(fs.existsSync(freshGitFile), true);
+        assert.equal(fs.existsSync(freshCmuxFile), true);
+        assert.equal(readPrEntries().length, 5);
       }
     );
   } finally {
@@ -856,6 +959,10 @@ test('updateCmuxStatus deduplicates per workspace across panes and rolls back on
           cmuxCli: path.join(root, 'nonexistent-cmux'),
           cacheDir: rollbackDir,
         });
+        assert.equal(
+          fs.readdirSync(rollbackDir).filter((f) => f.startsWith('cmux-') && f.endsWith('.json')).length,
+          1
+        );
         const rolledBack = await waitFor(() => fs.readdirSync(rollbackDir).length === 0);
         assert.equal(rolledBack, true);
       }

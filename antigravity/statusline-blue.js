@@ -220,11 +220,13 @@ const readGitInfoSync = (startDir) => {
       let branch = '';
       let detached = false;
       let isReftable = false;
+      let headSha = '';
       if (head.startsWith('ref: refs/heads/')) {
         branch = head.slice('ref: refs/heads/'.length).trim();
       } else if (head.startsWith('ref: ')) {
         branch = head.slice('ref: '.length).trim();
       } else if (head) {
+        headSha = head.toLowerCase();
         branch = head.slice(0, 7);
         detached = true;
       }
@@ -232,7 +234,7 @@ const readGitInfoSync = (startDir) => {
         branch = '';
         isReftable = true;
       }
-      return { repoDir: dir, branch, detached, isReftable };
+      return { repoDir: dir, branch, detached, isReftable, headSha };
     }
   } catch (_) {}
   return null;
@@ -536,6 +538,16 @@ const CYCLE_MODE_BADGES = {
   'accept-edits': `${GRAY}[${RESET}${BLUE}✏️ Edits${RESET}${GRAY}]${RESET}`,
 };
 
+const isNativeDetachedEcho = (nativeBranch, gitInfo) => {
+  if (!gitInfo?.detached) return false;
+  if (nativeBranch === 'HEAD' || nativeBranch === gitInfo.branch) return true;
+  return Boolean(
+    gitInfo.headSha &&
+      /^[0-9a-f]{7,64}$/i.test(nativeBranch) &&
+      gitInfo.headSha.startsWith(nativeBranch.toLowerCase())
+  );
+};
+
 const renderStatusLine = (data, opts = {}) => {
   const nowMs = typeof opts.nowMs === 'number' ? opts.nowMs : Date.now();
   const spawnRefresh = opts.spawnRefresh !== false;
@@ -587,7 +599,7 @@ const renderStatusLine = (data, opts = {}) => {
     const hasNativeBranch = typeof data.vcs?.branch === 'string' && data.vcs.branch.trim().length > 0;
     const repoDir = gitInfo?.repoDir || (hasNativeBranch && data.workspace?.project_dir) || '';
     let gitBranch = hasNativeBranch ? data.vcs.branch.trim() : gitInfo?.branch || '';
-    let isDetached = Boolean(gitInfo?.detached && (!hasNativeBranch || gitBranch === gitInfo.branch));
+    let isDetached = Boolean(gitInfo?.detached && (!hasNativeBranch || isNativeDetachedEcho(gitBranch, gitInfo)));
     let cachedGit = null;
     if (!gitBranch && gitInfo?.isReftable && repoDir) {
       cachedGit = getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDir);
