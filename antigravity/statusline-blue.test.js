@@ -140,7 +140,7 @@ test('prevents sibling Gemini pool bleed and labels mixed prefixes separately', 
     assert.equal(sharedGem.qWk.key, 'gemini-weekly');
   }
 
-  // Key-derived per-window labels distinguish Flash 5h from generic Gem Wk
+  // Per-window labels distinguish Flash 5h from generic Gem Wk
   const mixedGemOut = stripAnsi(
     renderStatusLine(
       makeBasePayload({
@@ -448,20 +448,27 @@ test('readGitInfoSync handles repo, worktree, detached HEAD, and reftable stubs'
   }
 });
 
-test('--refresh-git resolves reftable branch and detached HEAD off the hot path', async () => {
+test('--refresh-git avoids sync git forks on render and resolves reftable branch and detached HEAD', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sl-reftable-'));
   try {
     const cacheDir = path.join(root, 'cache');
+    const prCacheDir = path.join(cacheDir, 'pr');
+    const gitLog = path.join(root, 'git.log');
+    const repoNormal = path.join(root, 'repo-normal');
     const repoBranch = path.join(root, 'repo-branch');
     const repoDetached = path.join(root, 'repo-detached');
-    fs.mkdirSync(path.join(repoBranch, '.git'), { recursive: true });
-    fs.mkdirSync(path.join(repoDetached, '.git'), { recursive: true });
+    for (const r of [repoNormal, repoBranch, repoDetached]) {
+      fs.mkdirSync(path.join(r, '.git'), { recursive: true });
+    }
+    fs.writeFileSync(path.join(repoNormal, '.git', 'HEAD'), 'ref: refs/heads/main\n');
     fs.writeFileSync(path.join(repoBranch, '.git', 'HEAD'), 'ref: refs/heads/.invalid\n');
     fs.writeFileSync(path.join(repoDetached, '.git', 'HEAD'), 'ref: refs/heads/.invalid\n');
 
     const binDir = makeStubBin(root, {
       git: `#!/usr/bin/env node
+const fs = require('fs');
 const path = require('path');
+fs.appendFileSync(${JSON.stringify(gitLog)}, process.argv.slice(2).join(' ') + '\\n');
 const args = process.argv.slice(2);
 if (args[0] === '--no-optional-locks') args.shift();
 const base = path.basename(process.cwd());
@@ -482,61 +489,88 @@ if (args[0] === 'rev-parse' && args[1] === '--short') {
 }
 process.exit(1);
 `,
+      gh: `#!/usr/bin/env node\nprocess.exit(1);\n`,
     });
 
-    await withPatchedEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` }, async () => {
-      const readCacheForRepo = (repoPath, expectDetached) => {
-        if (!fs.existsSync(cacheDir)) return null;
-        for (const f of fs.readdirSync(cacheDir)) {
-          if (!f.startsWith('git-') || !f.endsWith('.json')) continue;
-          const data = JSON.parse(fs.readFileSync(path.join(cacheDir, f), 'utf8'));
-          if (
-            data.repoDir === repoPath &&
-            data.updatedAt > 0 &&
-            data.refreshingAt === undefined &&
-            Boolean(data.detached) === expectDetached
-          ) {
-            return data;
+    await withPatchedEnv(
+      { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`, GH_REPO: undefined },
+      async () => {
+        const readCacheForRepo = (repoPath, expectDetached) => {
+          if (!fs.existsSync(cacheDir)) return null;
+          for (const f of fs.readdirSync(cacheDir)) {
+            if (!f.startsWith('git-') || !f.endsWith('.json')) continue;
+            const data = JSON.parse(fs.readFileSync(path.join(cacheDir, f), 'utf8'));
+            if (
+              data.repoDir === repoPath &&
+              data.updatedAt > 0 &&
+              data.refreshingAt === undefined &&
+              Boolean(data.detached) === expectDetached
+            ) {
+              return data;
+            }
           }
-        }
-        return null;
-      };
+          return null;
+        };
 
-      const cold = stripAnsi(
-        renderStatusLine(makeBasePayload({ cwd: repoBranch }), { nowMs: Date.now(), spawnRefresh: false, cacheDir })
-      );
-      assert.doesNotMatch(cold, /\.invalid/);
-      assert.doesNotMatch(cold, /🌿/);
+        const normalCold = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repoNormal }), { nowMs: Date.now(), spawnRefresh: false, cacheDir })
+        );
+        assert.match(normalCold, /🌿 main/);
+        assert.doesNotMatch(normalCold, /●/);
+        assert.equal(fs.existsSync(gitLog), false);
 
-      renderStatusLine(makeBasePayload({ cwd: repoBranch }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
-      const branchEntry = await waitFor(() => readCacheForRepo(repoBranch, false));
-      assert.equal(branchEntry.branch, 'feat/reftable');
-      assert.equal(branchEntry.dirty, true);
+        const reftableCold = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repoBranch }), { nowMs: Date.now(), spawnRefresh: false, cacheDir })
+        );
+        assert.doesNotMatch(reftableCold, /\.invalid/);
+        assert.doesNotMatch(reftableCold, /🌿/);
+        assert.equal(fs.existsSync(gitLog), false);
 
-      const warmBranch = stripAnsi(
-        renderStatusLine(makeBasePayload({ cwd: repoBranch }), {
-          nowMs: branchEntry.updatedAt + 1000,
-          spawnRefresh: false,
-          cacheDir,
-        })
-      );
-      assert.match(warmBranch, /🌿 feat\/reftable●/);
+        // Positive control: spawnRefresh: true triggers background --refresh-git (logged by stub git)
+        renderStatusLine(makeBasePayload({ cwd: repoNormal }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
+        await waitFor(() => readCacheForRepo(repoNormal, false));
+        await waitFor(() => {
+          if (!fs.existsSync(prCacheDir)) return false;
+          return fs
+            .readdirSync(prCacheDir)
+            .filter((f) => f.endsWith('.json'))
+            .some((f) => {
+              const e = JSON.parse(fs.readFileSync(path.join(prCacheDir, f), 'utf8'));
+              return e.key === `${repoNormal}:main` && e.updatedAt > 0 && e.fetchingAt === undefined;
+            });
+        });
+        assert.match(fs.readFileSync(gitLog, 'utf8'), /status --porcelain -uno/);
 
-      renderStatusLine(makeBasePayload({ cwd: repoDetached }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
-      const detachedEntry = await waitFor(() => readCacheForRepo(repoDetached, true));
-      assert.equal(detachedEntry.branch, 'abc1234');
-      assert.equal(detachedEntry.detached, true);
+        renderStatusLine(makeBasePayload({ cwd: repoBranch }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
+        const branchEntry = await waitFor(() => readCacheForRepo(repoBranch, false));
+        assert.equal(branchEntry.branch, 'feat/reftable');
+        assert.equal(branchEntry.dirty, true);
 
-      const warmDetached = stripAnsi(
-        renderStatusLine(makeBasePayload({ cwd: repoDetached }), {
-          nowMs: detachedEntry.updatedAt + 1000,
-          spawnRefresh: false,
-          cacheDir,
-        })
-      );
-      assert.match(warmDetached, /🌿 abc1234/);
-      assert.doesNotMatch(warmDetached, /PR #/);
-    });
+        const warmBranch = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repoBranch }), {
+            nowMs: branchEntry.updatedAt + 1000,
+            spawnRefresh: false,
+            cacheDir,
+          })
+        );
+        assert.match(warmBranch, /🌿 feat\/reftable●/);
+
+        renderStatusLine(makeBasePayload({ cwd: repoDetached }), { nowMs: Date.now(), spawnRefresh: true, cacheDir });
+        const detachedEntry = await waitFor(() => readCacheForRepo(repoDetached, true));
+        assert.equal(detachedEntry.branch, 'abc1234');
+        assert.equal(detachedEntry.detached, true);
+
+        const warmDetached = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repoDetached }), {
+            nowMs: detachedEntry.updatedAt + 1000,
+            spawnRefresh: false,
+            cacheDir,
+          })
+        );
+        assert.match(warmDetached, /🌿 abc1234/);
+        assert.doesNotMatch(warmDetached, /PR #/);
+      }
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -715,6 +749,15 @@ process.stdout.write(JSON.stringify(payloads[branch]));
         assert.match(detachedOut, /🌿 1234567/);
         assert.doesNotMatch(detachedOut, /PR #1234567/);
 
+        const detachedWithVcsSha = stripAnsi(
+          renderStatusLine(makeBasePayload({ cwd: repo, vcs: { type: 'git', branch: '1234567' } }), {
+            spawnRefresh: false,
+            cacheDir,
+          })
+        );
+        assert.match(detachedWithVcsSha, /🌿 1234567/);
+        assert.doesNotMatch(detachedWithVcsSha, /PR #1234567/);
+
         // 7-day pruning covers stale .tmp and git-/cmux- cache files without removing fresh PR entries
         const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
         const stalePrTmp = path.join(prCacheDir, 'stale.123.tmp');
@@ -737,7 +780,7 @@ process.stdout.write(JSON.stringify(payloads[branch]));
   }
 });
 
-test('updateCmuxStatus deduplicates within 60s, fires on change, and rolls back on spawn error', async () => {
+test('updateCmuxStatus deduplicates per workspace across panes and rolls back on spawn error', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sl-cmux-'));
   try {
     const cacheDir = path.join(root, 'cache');
@@ -749,7 +792,8 @@ test('updateCmuxStatus deduplicates within 60s, fires on change, and rolls back 
       { mode: 0o755 }
     );
 
-    const payload = { conversation_id: 'conv-1' };
+    const payloadA = { conversation_id: 'conv-1' };
+    const payloadB = { conversation_id: 'conv-b' };
     const working = { cmuxValue: 'Working', cmuxIcon: 'gearshape.fill', cmuxColor: '#4C8DFF' };
     const idle = { cmuxValue: 'Idle', cmuxIcon: 'pause.circle.fill', cmuxColor: '#8E8E93' };
     const t0 = 1_700_000_000_000;
@@ -763,35 +807,59 @@ test('updateCmuxStatus deduplicates within 60s, fires on change, and rolls back 
     const readLogLines = () =>
       fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean) : [];
 
-    updateCmuxStatus(payload, working, t0, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
-    assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0);
+    await withPatchedEnv(
+      { CMUX_WINDOW_ID: 'win-1', CMUX_WORKSPACE_ID: 'ws-1', CMUX_SURFACE_ID: 'surf-a' },
+      async () => {
+        updateCmuxStatus(payloadA, working, t0, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
+        assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0);
 
-    updateCmuxStatus(payload, working, t0 + 1000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
-    assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0);
+        updateCmuxStatus(payloadA, working, t0 + 1000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
+        assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0);
 
-    await waitFor(() => readLogLines().length >= 1);
-    await new Promise((r) => setTimeout(r, 100));
-    assert.equal(readLogLines().length, 1);
+        await waitFor(() => readLogLines().length >= 1);
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(readLogLines().length, 1);
 
-    updateCmuxStatus(payload, idle, t0 + 2000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
-    assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0 + 2000);
-    const afterChange = await waitFor(() => {
-      const lines = readLogLines();
-      return lines.length >= 2 ? lines : null;
-    });
-    assert.equal(afterChange.length, 2);
-    assert.match(afterChange[0], /set-status agy Working/);
-    assert.match(afterChange[1], /set-status agy Idle/);
+        // Second pane in the same workspace overwrites shared 'agy' status to Idle
+        process.env.CMUX_SURFACE_ID = 'surf-b';
+        updateCmuxStatus(payloadB, idle, t0 + 2000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
+        assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0 + 2000);
+        const afterPaneB = await waitFor(() => {
+          const lines = readLogLines();
+          return lines.length >= 2 ? lines : null;
+        });
+        assert.equal(afterPaneB.length, 2);
 
-    const rollbackDir = path.join(root, 'cache-rollback');
-    fs.mkdirSync(rollbackDir, { recursive: true });
-    updateCmuxStatus(payload, working, t0, {
-      hasCmux: true,
-      cmuxCli: path.join(root, 'nonexistent-cmux'),
-      cacheDir: rollbackDir,
-    });
-    const rolledBack = await waitFor(() => fs.readdirSync(rollbackDir).length === 0);
-    assert.equal(rolledBack, true);
+        // Returning to Pane A must not be suppressed by a stale per-pane cache
+        process.env.CMUX_SURFACE_ID = 'surf-a';
+        updateCmuxStatus(payloadA, working, t0 + 3000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
+        assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0 + 3000);
+        const afterPaneA = await waitFor(() => {
+          const lines = readLogLines();
+          return lines.length >= 3 ? lines : null;
+        });
+        assert.equal(afterPaneA.length, 3);
+        assert.match(afterPaneA[0], /set-status agy Working/);
+        assert.match(afterPaneA[1], /set-status agy Idle/);
+        assert.match(afterPaneA[2], /set-status agy Working/);
+
+        // Repeat Working on Pane A within 60s dedupes again
+        updateCmuxStatus(payloadA, working, t0 + 4000, { hasCmux: true, cmuxCli: mockCmux, cacheDir });
+        assert.equal(findSingleCmuxCache(cacheDir).updatedAt, t0 + 3000);
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(readLogLines().length, 3);
+
+        const rollbackDir = path.join(root, 'cache-rollback');
+        fs.mkdirSync(rollbackDir, { recursive: true });
+        updateCmuxStatus(payloadA, working, t0, {
+          hasCmux: true,
+          cmuxCli: path.join(root, 'nonexistent-cmux'),
+          cacheDir: rollbackDir,
+        });
+        const rolledBack = await waitFor(() => fs.readdirSync(rollbackDir).length === 0);
+        assert.equal(rolledBack, true);
+      }
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

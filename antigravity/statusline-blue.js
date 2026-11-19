@@ -149,7 +149,7 @@ const updateCmuxStatus = (data, stateMeta, nowMs = Date.now(), opts = {}) => {
     if (!cmuxCli) return;
 
     const windowId = process.env.CMUX_WINDOW_ID || '';
-    const scope = `${windowId}:${workspaceId}:${process.env.CMUX_SURFACE_ID || data.conversation_id || 'default'}`;
+    const scope = `${windowId}:${workspaceId}`;
     const dedupePath = path.join(getCacheDir(opts.cacheDir), `cmux-${hashKey(scope)}.json`);
     const cached = readJsonSafe(dedupePath);
 
@@ -311,9 +311,6 @@ const getGitCacheEntry = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride 
   };
 };
 
-const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride = '') =>
-  getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDirOverride).dirty;
-
 const formatPrBadge = (pr) => {
   if (!pr || pr.state === 'NONE' || !pr.number) return '';
   if (pr.state === 'MERGED') {
@@ -435,20 +432,6 @@ const POOL_LABELS = {
   '3p': '3P',
 };
 
-const POOL_LABEL_ENTRIES = Object.entries(POOL_LABELS).sort((a, b) => b[0].length - a[0].length);
-
-const getPoolLabelForKey = (key, fallbackPrefix = '') => {
-  if (typeof key === 'string' && key) {
-    const normKey = key.toLowerCase().replace(/_/g, '-');
-    for (const [prefix, label] of POOL_LABEL_ENTRIES) {
-      if (normKey === prefix || normKey.startsWith(`${prefix}-`)) {
-        return label;
-      }
-    }
-  }
-  return POOL_LABELS[fallbackPrefix] || '';
-};
-
 const isFractionBucket = (bucket) =>
   Boolean(bucket) &&
   bucket.disabled !== true &&
@@ -486,8 +469,8 @@ const resolveQuotaSelection = (modelObj, quotaObj, nowMs = Date.now()) => {
   const { prefixes, excludeSubPrefixes } = resolveModelFamily(modelObj);
   const q5h = findQuotaBucket(quotaObj, prefixes, ['-5h', '_5h', '-session', '_session'], /(?:5h|hour)/i, excludeSubPrefixes);
   const qWk = findQuotaBucket(quotaObj, prefixes, ['-weekly', '-7d', '_weekly', '_7d'], /(?:week|7d)/i, excludeSubPrefixes);
-  const label5h = q5h ? getPoolLabelForKey(q5h.key, q5h.prefix) : '';
-  const labelWk = qWk ? getPoolLabelForKey(qWk.key, qWk.prefix) : '';
+  const label5h = q5h ? POOL_LABELS[q5h.prefix] || '' : '';
+  const labelWk = qWk ? POOL_LABELS[qWk.prefix] || '' : '';
   const poolLabel = label5h || labelWk || POOL_LABELS[prefixes[0]] || '';
 
   let credits = null;
@@ -521,8 +504,8 @@ const formatQuotaSegment = (modelObj, quotaObj, nowMs, width, { includePoolLabel
     return `${prefixStr}${label}: ${color}${pct}%${RESET}${reset}`;
   };
 
-  const label5h = q5h ? getPoolLabelForKey(q5h.key, q5h.prefix) : '';
-  const labelWk = qWk ? getPoolLabelForKey(qWk.key, qWk.prefix) : '';
+  const label5h = q5h ? POOL_LABELS[q5h.prefix] || '' : '';
+  const labelWk = qWk ? POOL_LABELS[qWk.prefix] || '' : '';
   const hasMixedPools = Boolean(q5h && qWk && label5h && labelWk && label5h !== labelWk);
 
   const parts = [
@@ -604,7 +587,7 @@ const renderStatusLine = (data, opts = {}) => {
     const hasNativeBranch = typeof data.vcs?.branch === 'string' && data.vcs.branch.trim().length > 0;
     const repoDir = gitInfo?.repoDir || (hasNativeBranch && data.workspace?.project_dir) || '';
     let gitBranch = hasNativeBranch ? data.vcs.branch.trim() : gitInfo?.branch || '';
-    let isDetached = Boolean(!hasNativeBranch && gitInfo?.detached);
+    let isDetached = Boolean(gitInfo?.detached && (!hasNativeBranch || gitBranch === gitInfo.branch));
     let cachedGit = null;
     if (!gitBranch && gitInfo?.isReftable && repoDir) {
       cachedGit = getGitCacheEntry(repoDir, nowMs, spawnRefresh, cacheDir);
@@ -745,7 +728,7 @@ module.exports = {
   getResetSeconds,
   resolveQuotaSelection,
   readGitInfoSync,
-  getGitDirtyCached,
+  getGitCacheEntry,
   refreshGitDirty,
   updateCmuxStatus,
   getPrBadgeCached,
