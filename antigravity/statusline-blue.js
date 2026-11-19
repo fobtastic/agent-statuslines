@@ -24,6 +24,7 @@ const PR_FETCH_LOCK_MS = 30000;
 const CACHE_TTL_SECONDS = 300;
 
 const hashKey = (str) => crypto.createHash('sha1').update(str).digest('hex').slice(0, 12);
+const getCacheDir = (overrideDir) => overrideDir || path.join(home, '.gemini', 'cache');
 
 const readJsonSafe = (filePath) => {
   try {
@@ -35,6 +36,7 @@ const readJsonSafe = (filePath) => {
 };
 
 const writeJsonAtomic = (filePath, obj) => {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
@@ -43,6 +45,31 @@ const writeJsonAtomic = (filePath, obj) => {
     try { fs.unlinkSync(tmp); } catch (_) {}
     throw e;
   }
+};
+
+const WIDE_SYMBOLS = new Set([0x23f3, 0x2699, 0x26a0, 0x26a1, 0x2705, 0x270f, 0x274c]);
+
+const displayWidth = (str) => {
+  const plain = String(str).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  let width = 0;
+  for (const ch of plain) {
+    const cp = ch.codePointAt(0);
+    if (cp === 0xfe0e || cp === 0xfe0f || cp === 0x200d) continue;
+    if (
+      (cp >= 0x1f300 && cp <= 0x1faff) ||
+      WIDE_SYMBOLS.has(cp) ||
+      (cp >= 0x1100 && cp <= 0x115f) ||
+      (cp >= 0x2e80 && cp <= 0x9fff) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xff01 && cp <= 0xff60)
+    ) {
+      width += 2;
+    } else {
+      width += 1;
+    }
+  }
+  return width;
 };
 
 const formatDuration = (seconds) => {
@@ -103,24 +130,27 @@ const resolveAgentState = (data) => {
   return STATE_TABLE[data.agent_state] || STATE_TABLE.idle;
 };
 
-const updateCmuxStatus = (data, stateMeta, nowMs = Date.now()) => {
+const updateCmuxStatus = (data, stateMeta, nowMs = Date.now(), opts = {}) => {
   try {
     const socketPath = process.env.CMUX_SOCKET_PATH || '';
     const workspaceId = process.env.CMUX_WORKSPACE_ID || '';
-    const hasCmux = Boolean(
-      socketPath ||
-        workspaceId ||
-        fs.existsSync(path.join(home, '.local/state/cmux/cmux.sock')) ||
-        fs.existsSync(path.join(home, '.cmux/socket_addr'))
-    );
+    const hasCmux =
+      opts.hasCmux !== undefined
+        ? opts.hasCmux
+        : Boolean(
+            socketPath ||
+              workspaceId ||
+              fs.existsSync(path.join(home, '.local/state/cmux/cmux.sock')) ||
+              fs.existsSync(path.join(home, '.cmux/socket_addr'))
+          );
     if (!hasCmux) return;
 
-    const cmuxCli = resolveCmuxCli();
+    const cmuxCli = opts.cmuxCli !== undefined ? opts.cmuxCli : resolveCmuxCli();
     if (!cmuxCli) return;
 
     const windowId = process.env.CMUX_WINDOW_ID || '';
     const scope = `${windowId}:${workspaceId}:${process.env.CMUX_SURFACE_ID || data.conversation_id || 'default'}`;
-    const dedupePath = path.join(os.tmpdir(), `agy-cmux-${hashKey(scope)}.json`);
+    const dedupePath = path.join(getCacheDir(opts.cacheDir), `cmux-${hashKey(scope)}.json`);
     const cached = readJsonSafe(dedupePath);
 
     if (
@@ -151,7 +181,10 @@ const updateCmuxStatus = (data, stateMeta, nowMs = Date.now()) => {
     if (windowId) args.push('--window', windowId);
     args.push('--icon', stateMeta.cmuxIcon, '--color', stateMeta.cmuxColor);
 
-    const child = spawn(cmuxCli, args, { detached: true, stdio: 'ignore' });
+    const child = spawn(cmuxCli, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {
+      try { fs.unlinkSync(dedupePath); } catch (_) {}
+    });
     child.unref();
   } catch (_) {}
 };
@@ -160,7 +193,7 @@ const readGitInfoSync = (startDir) => {
   if (!startDir) return null;
   try {
     let dir = path.resolve(startDir);
-    for (let depth = 0; depth < 16; depth++) {
+    while (true) {
       const dotGit = path.join(dir, '.git');
       let stat = null;
       try {
@@ -184,12 +217,18 @@ const readGitInfoSync = (startDir) => {
       if (!gitDir) break;
 
       const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
-      const branch = head.startsWith('ref: refs/heads/')
-        ? head.slice('ref: refs/heads/'.length).trim()
-        : head.startsWith('ref: ')
-          ? head.slice('ref: '.length).trim()
-          : head.slice(0, 7);
-      return branch ? { repoDir: dir, branch } : null;
+      let branch = '';
+      let detached = false;
+      if (head.startsWith('ref: refs/heads/')) {
+        branch = head.slice('ref: refs/heads/'.length).trim();
+      } else if (head.startsWith('ref: ')) {
+        branch = head.slice('ref: '.length).trim();
+      } else if (head) {
+        branch = head.slice(0, 7);
+        detached = true;
+      }
+      if (branch === '.invalid') branch = '';
+      return { repoDir: dir, branch, detached };
     }
   } catch (_) {}
   return null;
@@ -201,14 +240,14 @@ const refreshGitDirty = (repoDir, cachePath) => {
     const out = execFileSync(
       'git',
       ['--no-optional-locks', 'status', '--porcelain', '-uno'],
-      { cwd: repoDir, timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      { cwd: repoDir, timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }
     ).trim();
     writeJsonAtomic(cachePath, { repoDir, dirty: out.length > 0, updatedAt: Date.now() });
   } catch (_) {}
 };
 
-const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true) => {
-  const cachePath = path.join(os.tmpdir(), `agy-git-${hashKey(repoDir)}.json`);
+const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true, cacheDirOverride = '') => {
+  const cachePath = path.join(getCacheDir(cacheDirOverride), `git-${hashKey(repoDir)}.json`);
   const entry = readJsonSafe(cachePath);
   const isStale = !entry || typeof entry.updatedAt !== 'number' || nowMs - entry.updatedAt >= GIT_DIRTY_TTL_MS;
   const isRefreshing = entry && typeof entry.refreshingAt === 'number' && nowMs - entry.refreshingAt < GIT_REFRESH_LOCK_MS;
@@ -224,7 +263,9 @@ const getGitDirtyCached = (repoDir, nowMs, spawnRefresh = true) => {
       const child = spawn(process.execPath, [__filename, '--refresh-git', repoDir, cachePath], {
         detached: true,
         stdio: 'ignore',
+        windowsHide: true,
       });
+      child.on('error', () => {});
       child.unref();
     } catch (_) {}
   }
@@ -282,22 +323,24 @@ const formatPrBadge = (pr) => {
   return ` ${GRAY}(${RESET}${prColor}PR #${pr.number}${prSuffix}${RESET}${GRAY})${RESET}`;
 };
 
-const getPrBadgeCached = (repoDir, gitBranch, nowMs, spawnRefresh = true) => {
-  const cacheFile = path.join(home, '.gemini', 'pr-cache.json');
+const getPrBadgeCached = (repoDir, gitBranch, nowMs, opts = {}) => {
+  const spawnRefresh = opts.spawnRefresh !== false;
+  const prCacheDir = path.join(getCacheDir(opts.cacheDir), 'pr');
   const cacheKey = `${repoDir}:${gitBranch}`;
-  const cache = readJsonSafe(cacheFile) || {};
-  const cachedEntry = cache[cacheKey];
-  const isStale = !cachedEntry || nowMs - cachedEntry.updatedAt > PR_CACHE_TTL_MS;
+  const entryPath = path.join(prCacheDir, `${hashKey(cacheKey)}.json`);
+  const cachedEntry = readJsonSafe(entryPath);
+  const isStale = !cachedEntry || typeof cachedEntry.updatedAt !== 'number' || nowMs - cachedEntry.updatedAt > PR_CACHE_TTL_MS;
   const isFetching = cachedEntry?.fetchingAt && nowMs - cachedEntry.fetchingAt < PR_FETCH_LOCK_MS;
 
   if (spawnRefresh && isStale && !isFetching) {
     try {
-      cache[cacheKey] = Object.assign({}, cachedEntry || { state: 'NONE', updatedAt: 0 }, { fetchingAt: nowMs });
-      writeJsonAtomic(cacheFile, cache);
-      const child = spawn(process.execPath, [path.join(__dirname, 'update_pr_cache.js'), repoDir, gitBranch], {
-        detached: true,
-        stdio: 'ignore',
-      });
+      writeJsonAtomic(entryPath, Object.assign({}, cachedEntry || { key: cacheKey, state: 'NONE', updatedAt: 0 }, { fetchingAt: nowMs }));
+      const child = spawn(
+        process.execPath,
+        [path.join(__dirname, 'update_pr_cache.js'), repoDir, gitBranch, prCacheDir],
+        { detached: true, stdio: 'ignore', windowsHide: true }
+      );
+      child.on('error', () => {});
       child.unref();
     } catch (_) {}
   }
@@ -308,21 +351,21 @@ const getPrBadgeCached = (repoDir, gitBranch, nowMs, spawnRefresh = true) => {
 const resolveModelFamily = (modelObj) => {
   const ident = `${modelObj?.id || ''} ${modelObj?.display_name || ''}`.toLowerCase();
   if (/\b(claude|opus|sonnet|haiku)\b/.test(ident)) {
-    return { family: 'claude', prefixes: ['claude', 'anthropic', '3p'] };
+    return { family: 'claude', prefixes: ['claude', 'anthropic', '3p'], excludeSubPrefixes: [] };
   }
   if (/\b(gpt|openai|codex|o1|o3|o4)\b/.test(ident)) {
-    return { family: 'gpt', prefixes: ['gpt', 'openai', '3p'] };
+    return { family: 'gpt', prefixes: ['gpt', 'openai', '3p'], excludeSubPrefixes: [] };
   }
   if (/\b(gemini|gemma|antigravity|orchestrator)\b/.test(ident)) {
     if (/\bflash\b/.test(ident)) {
-      return { family: 'gemini', prefixes: ['gemini-flash', 'flash', 'gemini'] };
+      return { family: 'gemini', prefixes: ['gemini-flash', 'flash', 'gemini'], excludeSubPrefixes: ['gemini-pro'] };
     }
     if (/\b(pro|argon|carbon|hydrogen|neon|orchestrator)\b/.test(ident)) {
-      return { family: 'gemini', prefixes: ['gemini-pro', 'pro', 'gemini'] };
+      return { family: 'gemini', prefixes: ['gemini-pro', 'pro', 'gemini'], excludeSubPrefixes: ['gemini-flash'] };
     }
-    return { family: 'gemini', prefixes: ['gemini'] };
+    return { family: 'gemini', prefixes: ['gemini'], excludeSubPrefixes: [] };
   }
-  return { family: '3p', prefixes: ['3p'] };
+  return { family: '3p', prefixes: ['3p'], excludeSubPrefixes: [] };
 };
 
 const getResetSeconds = (bucket, nowMs = Date.now()) => {
@@ -357,7 +400,7 @@ const isFractionBucket = (bucket) =>
   typeof bucket.remaining_fraction === 'number' &&
   Number.isFinite(bucket.remaining_fraction);
 
-const findQuotaBucket = (quotaObj, prefixes, exactSuffixes, fuzzyRegex) => {
+const findQuotaBucket = (quotaObj, prefixes, exactSuffixes, fuzzyRegex, excludeSubPrefixes = []) => {
   const keys = Object.keys(quotaObj);
   for (const prefix of prefixes) {
     for (const suffix of exactSuffixes) {
@@ -367,6 +410,10 @@ const findQuotaBucket = (quotaObj, prefixes, exactSuffixes, fuzzyRegex) => {
       }
     }
     for (const k of keys) {
+      const isSiblingSub = excludeSubPrefixes.some(
+        (ex) => k.startsWith(`${ex}-`) || k.startsWith(`${ex}_`) || k === ex
+      );
+      if (isSiblingSub) continue;
       if ((k.startsWith(`${prefix}-`) || k.startsWith(`${prefix}_`)) && fuzzyRegex.test(k.slice(prefix.length + 1))) {
         if (isFractionBucket(quotaObj[k])) {
           return { key: k, prefix, bucket: quotaObj[k] };
@@ -382,9 +429,9 @@ const resolveQuotaSelection = (modelObj, quotaObj, nowMs = Date.now()) => {
     return { poolLabel: '', q5h: null, qWk: null, credits: null };
   }
 
-  const { prefixes } = resolveModelFamily(modelObj);
-  const q5h = findQuotaBucket(quotaObj, prefixes, ['-5h', '_5h', '-session', '_session'], /(?:5h|hour)/i);
-  const qWk = findQuotaBucket(quotaObj, prefixes, ['-weekly', '-7d', '_weekly', '_7d'], /(?:week|7d)/i);
+  const { prefixes, excludeSubPrefixes } = resolveModelFamily(modelObj);
+  const q5h = findQuotaBucket(quotaObj, prefixes, ['-5h', '_5h', '-session', '_session'], /(?:5h|hour)/i, excludeSubPrefixes);
+  const qWk = findQuotaBucket(quotaObj, prefixes, ['-weekly', '-7d', '_weekly', '_7d'], /(?:week|7d)/i, excludeSubPrefixes);
   const matchedPrefix = q5h?.prefix || qWk?.prefix || prefixes[0] || '';
   const poolLabel = POOL_LABELS[matchedPrefix] || '';
 
@@ -406,19 +453,28 @@ const resolveQuotaSelection = (modelObj, quotaObj, nowMs = Date.now()) => {
   return { poolLabel, q5h, qWk, credits };
 };
 
-const formatQuotaSegment = (modelObj, quotaObj, nowMs, width) => {
+const formatQuotaSegment = (modelObj, quotaObj, nowMs, width, { includePoolLabel = true } = {}) => {
   const { poolLabel, q5h, qWk, credits } = resolveQuotaSelection(modelObj, quotaObj, nowMs);
 
-  const formatBucket = (label, entry) => {
+  const formatBucket = (label, entry, perWindowPrefix = '') => {
     if (!entry) return '';
     const pct = Math.max(0, Math.min(100, Math.round(entry.bucket.remaining_fraction * 100)));
     const color = pct >= 50 ? GREEN : pct >= 20 ? YELLOW : RED;
     const resetSec = getResetSeconds(entry.bucket, nowMs);
     const reset = resetSec > 0 ? ` ${GRAY}↻${formatDuration(resetSec)}${RESET}` : '';
-    return `${label}: ${color}${pct}%${RESET}${reset}`;
+    const prefixStr = perWindowPrefix ? `${GRAY}${perWindowPrefix}${RESET} ` : '';
+    return `${prefixStr}${label}: ${color}${pct}%${RESET}${reset}`;
   };
 
-  const parts = [formatBucket('5h', q5h), formatBucket('Wk', qWk)].filter(Boolean);
+  const label5h = q5h ? POOL_LABELS[q5h.prefix] || '' : '';
+  const labelWk = qWk ? POOL_LABELS[qWk.prefix] || '' : '';
+  const hasMixedPools = Boolean(q5h && qWk && label5h && labelWk && label5h !== labelWk);
+
+  const parts = [
+    formatBucket('5h', q5h, hasMixedPools ? label5h : ''),
+    formatBucket('Wk', qWk, hasMixedPools ? labelWk : ''),
+  ].filter(Boolean);
+
   const minFrac = Math.min(
     ...[q5h?.bucket.remaining_fraction, qWk?.bucket.remaining_fraction].filter((v) => typeof v === 'number')
   );
@@ -431,9 +487,9 @@ const formatQuotaSegment = (modelObj, quotaObj, nowMs, width) => {
     return ` ${GRAY}|${RESET} 🔋 ${creditPart}`;
   }
 
-  const labelPrefix = poolLabel ? `${GRAY}${poolLabel}${RESET} ` : '';
+  const sharedLabel = !hasMixedPools && includePoolLabel && poolLabel ? `${GRAY}${poolLabel}${RESET} ` : '';
   const joined = showCredits ? [...parts, creditPart].join(` ${GRAY}·${RESET} `) : parts.join(` ${GRAY}·${RESET} `);
-  return ` ${GRAY}|${RESET} 🔋 ${labelPrefix}${joined}`;
+  return ` ${GRAY}|${RESET} 🔋 ${sharedLabel}${joined}`;
 };
 
 const CYCLE_MODE_BADGES = {
@@ -445,9 +501,8 @@ const CYCLE_MODE_BADGES = {
 const renderStatusLine = (data, opts = {}) => {
   const nowMs = typeof opts.nowMs === 'number' ? opts.nowMs : Date.now();
   const spawnRefresh = opts.spawnRefresh !== false;
+  const cacheDir = opts.cacheDir;
   const width = typeof data.terminal_width === 'number' && data.terminal_width > 0 ? data.terminal_width : 140;
-  const isCompact = width < 105;
-  const isNarrow = width < 90;
 
   let model = data.model?.display_name || 'Antigravity';
   const effort = data.model?.effort;
@@ -491,17 +546,19 @@ const renderStatusLine = (data, opts = {}) => {
     gitStr = ` ${GRAY}|${RESET} 🌿 ${BLUE}${label}${dirtyIndicator}${RESET}`;
   } else {
     const gitInfo = readGitInfoSync(cwd);
-    const gitBranch = typeof data.vcs?.branch === 'string' && data.vcs.branch.trim() ? data.vcs.branch.trim() : gitInfo?.branch || '';
+    const hasNativeBranch = typeof data.vcs?.branch === 'string' && data.vcs.branch.trim().length > 0;
+    const gitBranch = hasNativeBranch ? data.vcs.branch.trim() : gitInfo?.branch || '';
     const repoDir = gitInfo?.repoDir || (gitBranch && data.workspace?.project_dir) || '';
     if (gitBranch) {
       let isDirty = false;
       if (typeof data.vcs?.dirty === 'boolean') {
         isDirty = data.vcs.dirty;
       } else if (repoDir) {
-        isDirty = getGitDirtyCached(repoDir, nowMs, spawnRefresh);
+        isDirty = getGitDirtyCached(repoDir, nowMs, spawnRefresh, cacheDir);
       }
       const dirtyIndicator = isDirty ? `${RED}●${RESET}` : '';
-      const prStr = repoDir ? getPrBadgeCached(repoDir, gitBranch, nowMs, spawnRefresh) : '';
+      const skipDetachedPr = Boolean(gitInfo?.detached && !hasNativeBranch);
+      const prStr = repoDir && !skipDetachedPr ? getPrBadgeCached(repoDir, gitBranch, nowMs, { spawnRefresh, cacheDir }) : '';
       gitStr = ` ${GRAY}|${RESET} 🌿 ${BLUE}${gitBranch}${dirtyIndicator}${prStr}${RESET}`;
     }
   }
@@ -511,11 +568,6 @@ const renderStatusLine = (data, opts = {}) => {
   const totalTokens = ctx.context_window_size || 1048576;
   const usedPctNum = typeof ctx.used_percentage === 'number' && Number.isFinite(ctx.used_percentage) ? ctx.used_percentage : 0;
   const usedPercent = usedPctNum.toFixed(1);
-
-  const barSize = isCompact ? 6 : 10;
-  const filled = Math.min(barSize, Math.max(0, Math.round((usedPctNum * barSize) / 100)));
-  const bar = '█'.repeat(filled);
-  const barEmpty = '░'.repeat(barSize - filled);
 
   let pctColor = '';
   if (usedPctNum >= 85) pctColor = RED;
@@ -551,19 +603,47 @@ const renderStatusLine = (data, opts = {}) => {
   }
 
   const outTokens = ctx.total_output_tokens || 0;
-  const outStr = !isNarrow && outTokens > 0 ? `, Out: ${formatTokens(outTokens)}` : '';
-  const ctxLabel = isCompact ? 'Ctx' : 'Context:';
-  const cacheStr = isCompact
-    ? ` ${GRAY}|${RESET} ⚡ ${BLUE}${cacheHitRate}%${RESET}${cacheTtlStr}`
-    : ` ${GRAY}|${RESET} ⚡ Cache: ${BLUE}${cacheHitRate}%${RESET}${cacheTtlStr}`;
-  const quotaStr = formatQuotaSegment(data.model, data.quota, nowMs, width);
+  const quotaWithPool = formatQuotaSegment(data.model, data.quota, nowMs, width, { includePoolLabel: true });
+  const quotaCompact = formatQuotaSegment(data.model, data.quota, nowMs, width, { includePoolLabel: false });
   const costStr =
-    !isCompact && width >= 115 && data.cost && typeof data.cost.total_usd === 'number' && data.cost.total_usd > 0
+    width >= 115 && data.cost && typeof data.cost.total_usd === 'number' && data.cost.total_usd > 0
       ? ` ${GRAY}|${RESET} 💵 ${data.cost.estimated ? '~' : ''}$${data.cost.total_usd.toFixed(2)}`
       : '';
 
+  const buildBar = (barSize) => {
+    const filled = Math.min(barSize, Math.max(0, Math.round((usedPctNum * barSize) / 100)));
+    return `${'█'.repeat(filled)}${GRAY}${'░'.repeat(barSize - filled)}`;
+  };
+
+  const buildLine2 = (tier) => {
+    const compact = tier >= 2;
+    const barSize = compact ? 6 : 10;
+    const ctxLabel = compact ? 'Ctx' : 'Context:';
+    const outStr = !compact && outTokens > 0 ? `, Out: ${formatTokens(outTokens)}` : '';
+    const tokenPart = tier >= 5 ? '' : ` (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)`;
+
+    let cachePart = '';
+    if (tier <= 1) {
+      cachePart = ` ${GRAY}|${RESET} ⚡ Cache: ${BLUE}${cacheHitRate}%${RESET}${cacheTtlStr}`;
+    } else if (tier === 2) {
+      cachePart = ` ${GRAY}|${RESET} ⚡ ${BLUE}${cacheHitRate}%${RESET}${cacheTtlStr}`;
+    } else if (tier === 3) {
+      cachePart = ` ${GRAY}|${RESET} ⚡ ${BLUE}${cacheHitRate}%${RESET}`;
+    }
+
+    const quotaPart = tier >= 5 ? quotaCompact : quotaWithPool;
+    const tierCost = tier === 0 ? costStr : '';
+    return `${GRAY}└─▶${RESET} ${ctxLabel} [${BLUE}${buildBar(barSize)}${RESET}] ${pctStr}${tokenPart}${cachePart}${quotaPart}${tierCost}\x1b[K`;
+  };
+
+  const startTier = width >= 105 ? 0 : 2;
+  let line2 = '';
+  for (let tier = startTier; tier <= 5; tier++) {
+    line2 = buildLine2(tier);
+    if (displayWidth(line2) <= width) break;
+  }
+
   const line1 = `${BLUE}🤖 ${model}${RESET}${statusStr} ${GRAY}|${RESET} 📂 ${cwdShort}${gitStr}\x1b[K`;
-  const line2 = `${GRAY}└─▶${RESET} ${ctxLabel} [${BLUE}${bar}${GRAY}${barEmpty}${RESET}] ${pctStr} (${formatTokens(usedTokens)}/${formatTokens(totalTokens)}${outStr} t)${cacheStr}${quotaStr}${costStr}\x1b[K`;
   return `${line1}\n${line2}`;
 };
 
@@ -595,11 +675,16 @@ if (require.main === module) {
 }
 
 module.exports = {
+  displayWidth,
   formatDuration,
   formatTokens,
   resolveModelFamily,
   getResetSeconds,
   resolveQuotaSelection,
   readGitInfoSync,
+  getGitDirtyCached,
+  refreshGitDirty,
+  updateCmuxStatus,
+  getPrBadgeCached,
   renderStatusLine,
 };
