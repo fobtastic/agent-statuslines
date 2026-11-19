@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFileSync } = require('child_process');
 
 const repoDir = process.argv[2];
 const branchName = process.argv[3];
-const home = process.env.HOME || '/home/ubuntu';
+const home = process.env.HOME || os.homedir() || '/home/ubuntu';
 const cacheFile = path.join(home, '.gemini', 'pr-cache.json');
+
+const writeJsonAtomic = (filePath, obj) => {
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw e;
+  }
+};
 
 if (!repoDir || !branchName) {
   process.exit(1);
@@ -64,8 +76,6 @@ try {
     }
   }
 
-  fs.writeFileSync(cacheFile, JSON.stringify(cache, null, 2), 'utf8');
-  process.exit(0);
+  writeJsonAtomic(cacheFile, cache);
 } catch (e) {
-  process.exit(0);
 }
